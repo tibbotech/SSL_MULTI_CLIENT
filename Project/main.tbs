@@ -1,0 +1,169 @@
+include "global.tbh"
+
+dim clients_on as no_yes
+dim next_sock as byte       'next socket to connect; NUM_TLS_SOCKS = nothing pending
+dim tick_count as byte
+dim tls_up(NUM_TLS_SOCKS) as no_yes    'YES once a socket has completed its TLS handshake
+
+'------------------------------------------------------------------------------
+sub on_sys_init()
+    boot()
+end sub
+
+'------------------------------------------------------------------------------
+sub boot()
+    net.ip        = DEVICE_IP
+    net.netmask   = DEVICE_MASK
+    net.gatewayip = DEVICE_GW
+
+    dim i as byte
+    for i = 0 to NUM_TLS_SOCKS - 1
+        sock.num = i
+        sock.rxbuffrq(TLS_RX_BUFF)
+        sock.txbuffrq(TLS_TX_BUFF)
+    next i
+
+    sys.buffalloc()
+    sys.debugprint("Buffer pages free after alloc: " + str(sys.freebuffpages) + "\r\n")
+
+    'Configure sockets but do not connect — press MD to initiate
+    for i = 0 to NUM_TLS_SOCKS - 1
+        sock.num       = i
+        sock.protocol  = PL_SOCK_PROTOCOL_TCP
+        sock.inconmode = PL_SOCK_INCONMODE_NONE
+        sock.reconmode = PL_SOCK_RECONMODE_0
+        tls_up(i)      = NO
+    next i
+
+    clients_on = NO
+    next_sock  = NUM_TLS_SOCKS
+    tick_count = 0
+    sys.debugprint("SSL_MULTI_CLIENT ready. Press MD to connect/disconnect " + str(NUM_TLS_SOCKS) + " sockets to " + SERVER_IP + ":" + str(SERVER_PORT) + "\r\n")
+end sub
+
+'------------------------------------------------------------------------------
+'Press MD to connect all sockets; press again to disconnect all.
+'Connecting only schedules the work; on_sys_timer opens one socket per interval.
+sub on_button_pressed()
+    if clients_on = NO then
+        clients_on = YES
+        next_sock  = 0
+        tick_count = CONNECT_INTERVAL_TICKS    'first socket connects on the next tick
+        sys.debugprint("MD: connecting " + str(NUM_TLS_SOCKS) + " sockets to " + SERVER_IP + ":" + str(SERVER_PORT) + ", one every " + str(CONNECT_INTERVAL_TICKS * 500) + " ms\r\n")
+    else
+        clients_on = NO
+        next_sock  = NUM_TLS_SOCKS             'cancel any connections still pending
+        dim i as byte
+        dim count as byte
+        count = 0
+        for i = 0 to NUM_TLS_SOCKS - 1
+            sock.num = i
+            if sock.statesimple <> PL_SSTS_CLOSED then
+                sock.close
+                count = count + 1
+            end if
+        next i
+        sys.debugprint("MD: disconnecting " + str(count) + " sockets\r\n")
+    end if
+end sub
+
+'------------------------------------------------------------------------------
+sub on_sys_timer()
+    if next_sock >= NUM_TLS_SOCKS then exit sub
+    tick_count = tick_count + 1
+    if tick_count < CONNECT_INTERVAL_TICKS then exit sub
+    tick_count = 0
+    connect_next()
+end sub
+
+'------------------------------------------------------------------------------
+'Opens the socket at next_sock (if it is closed) and advances to the next one.
+sub connect_next()
+    sock.num = next_sock
+    if sock.statesimple = PL_SSTS_CLOSED then
+        sock.targetip   = SERVER_IP
+        sock.targetport = SERVER_PORT
+        sys.debugprint("sock[" + str(sock.num) + "] connecting...\r\n")
+        sock.connect
+    end if
+    next_sock = next_sock + 1
+end sub
+
+'------------------------------------------------------------------------------
+function count_active() as byte
+    'Counts sockets that finished the TLS handshake (not just TCP-connected ones)
+    dim i as byte
+    dim n as byte
+    n = 0
+    for i = 0 to NUM_TLS_SOCKS - 1
+        if tls_up(i) = YES then n = n + 1
+    next i
+    count_active = n
+end function
+
+'------------------------------------------------------------------------------
+sub on_sock_event(newstate as pl_sock_state, newstatesimple as pl_sock_state_simple)
+    if sock.num < NUM_TLS_SOCKS then
+        tls_client_event(newstate, newstatesimple)
+    end if
+end sub
+
+'------------------------------------------------------------------------------
+sub on_sock_data_arrival()
+    if sock.num < NUM_TLS_SOCKS then
+        tls_client_data()
+    end if
+end sub
+
+'------------------------------------------------------------------------------
+sub tls_client_event(newstate as pl_sock_state, newstatesimple as pl_sock_state_simple)
+    if newstatesimple = PL_SSTS_CLOSED then
+        tls_up(sock.num) = NO
+        sys.debugprint("sock[" + str(sock.num) + "] closed (state=" + str(newstate) + ") active: " + str(count_active()) + "/" + str(NUM_TLS_SOCKS) + "\r\n")
+        sock.rxclear
+        sock.txclear
+        sock.tlsdeinit
+        exit sub
+    end if
+
+    select case newstate
+    case PL_SST_EST_AOPENED:
+        sys.debugprint("sock[" + str(sock.num) + "] TCP connected to " + sock.remoteip + ":" + str(sock.remoteport) + "\r\n")
+        sock.tlsdeinit
+        romfile.open(CA_CERT)
+        dim tls_res as pl_tls_result = sock.tlsinit(romfile.offset)
+        if tls_res <> PL_TLS_SUCCESS then
+            sys.debugprint("sock[" + str(sock.num) + "] tlsinit FAILED (" + str(tls_res) + ")\r\n")
+            sock.close
+            exit sub
+        end if
+        tls_res = sock.tlshandshake(SERVER_IP)
+        if tls_res <> PL_TLS_SUCCESS then
+            sys.debugprint("sock[" + str(sock.num) + "] tlshandshake FAILED (" + str(tls_res) + ")\r\n")
+            sock.close
+            exit sub
+        end if
+        sys.debugprint("sock[" + str(sock.num) + "] TLS handshake started...\r\n")
+
+    case PL_SST_EST_TLS:
+        tls_up(sock.num) = YES
+        sys.debugprint("sock[" + str(sock.num) + "] TLS established. active: " + str(count_active()) + "/" + str(NUM_TLS_SOCKS) + "\r\n")
+
+    case PL_SST_EST_TLS_FAILED:
+        tls_up(sock.num) = NO
+        sys.debugprint("sock[" + str(sock.num) + "] TLS handshake FAILED - resetting\r\n")
+        sock.rxclear
+        sock.reset
+    end select
+end sub
+
+'------------------------------------------------------------------------------
+sub tls_client_data()
+    if sock.statesimple <> PL_SSTS_EST then exit sub
+    dim data as string
+    data = sock.tlsgetdata(255)
+    while len(data) > 0
+        sys.debugprint("sock[" + str(sock.num) + "] RX[" + str(len(data)) + "]: " + data + "\r\n")
+        data = sock.tlsgetdata(255)
+    wend
+end sub
