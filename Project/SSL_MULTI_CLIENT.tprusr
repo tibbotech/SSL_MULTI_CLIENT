@@ -6,8 +6,8 @@ cursor=2179
 opened=yes
 breakpoints=
 [file2]
-line=0
-cursor=511
+line=24
+cursor=512
 opened=active
 breakpoints=
 [file3]
